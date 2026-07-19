@@ -1,0 +1,18 @@
+{
+  "name": "tterm-connect",
+  "version": "0.1.0",
+  "private": true,
+  "description": "tterm machine-side connector — bridges a browser terminal to a real shell over peer-to-peer WebRTC",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "convex": "^1.42.3",
+    "node-datachannel": "^0.26.0",
+    "node-pty": "^1.0.0"
+  }
+}
