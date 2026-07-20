@@ -85,7 +85,7 @@ via the process list.
 
 | Flag | Env var | Meaning |
 |------|---------|---------|
-| `--endpointUrl <url>` | `TTERM_TTERM_ENDPOINT_URL` | Your tterm deployment URL |
+| `--endpointUrl <url>` | `TTERM_ENDPOINT_URL` | Your tterm deployment URL |
 | `--token <token>` | `TTERM_TOKEN` | Device token from **Add server** (only its sha256 is ever sent) |
 | `--shell <path>` | `TTERM_SHELL` | Override the shell. Default: `powershell.exe` on Windows, `$SHELL` (or `/bin/bash`) elsewhere |
 
@@ -93,12 +93,12 @@ Environment-variable form:
 
 ```bash
 # Linux / macOS
-TTERM_TTERM_ENDPOINT_URL=<TTERM_ENDPOINT_URL> TTERM_TOKEN=<TOKEN> node index.js
+TTERM_ENDPOINT_URL=<TTERM_ENDPOINT_URL> TTERM_TOKEN=<TOKEN> node index.js
 ```
 
 ```powershell
 # Windows (PowerShell)
-$env:TTERM_TTERM_ENDPOINT_URL="<TTERM_ENDPOINT_URL>"; $env:TTERM_TOKEN="<TOKEN>"; node index.js
+$env:TTERM_ENDPOINT_URL="<TTERM_ENDPOINT_URL>"; $env:TTERM_TOKEN="<TOKEN>"; node index.js
 ```
 
 ## Good to know

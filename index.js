@@ -20,12 +20,12 @@ function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
   return i !== -1 ? process.argv[i + 1] : undefined;
 }
-const CONVEX_URL = arg('convex') || process.env.TTERM_CONVEX_URL;
+const ENDPOINT_URL = arg('endpointUrl') || process.env.TTERM_ENDPOINT_URL;
 const TOKEN = arg('token') || process.env.TTERM_TOKEN;
 const SHELL_OVERRIDE = arg('shell') || process.env.TTERM_SHELL;
-if (!CONVEX_URL || !TOKEN) {
-  console.error('usage: node index.js --convex <convex-url> --token <device-token> [--shell <path>]');
-  console.error('   or: TTERM_CONVEX_URL=… TTERM_TOKEN=… node index.js');
+if (!ENDPOINT_URL || !TOKEN) {
+  console.error('usage: node index.js --endpointUrl <endpoint-url> --token <device-token> [--shell <path>]');
+  console.error('   or: TTERM_ENDPOINT_URL=… TTERM_TOKEN=… node index.js');
   process.exit(1);
 }
 const tokenHash = createHash('sha256').update(TOKEN).digest('hex');
@@ -45,7 +45,7 @@ const log = (...args) => console.log(new Date().toISOString().slice(11, 19), ...
 const sid = id => id.slice(-6);
 
 // ---------- convex link ----------
-const convex = new ConvexClient(CONVEX_URL);
+const convex = new ConvexClient(ENDPOINT_URL);
 const STUN = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }] };
 
 // sessionId -> { pc, dc, pty, buffer:[Buffer], bufferSize, openedAt, detachedAt, pcUsed, resetting }
