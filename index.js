@@ -198,7 +198,7 @@ function onChannelMessage(conn, sessionId, data) {
         try { conn.pty.resize(msg.cols, msg.rows); } catch { /* racing exit */ }
         log(`session ${sid(sessionId)}: replayed ${conn.bufferSize} buffered bytes`);
       } else {
-        spawnPty(conn, sessionId, msg.cols, msg.rows);
+        spawnPty(conn, sessionId, msg.cols, msg.rows, msg.preset);
       }
     }
     if (msg.type === 'resize' && conn.pty) {
@@ -225,16 +225,43 @@ function replayBuffer(conn) {
   }
 }
 
-function spawnPty(conn, sessionId, cols = 80, rows = 24) {
-  const shell = pickShell();
-  const cwd = resolveCwd();
-  conn.pty = pty.spawn(shell, [], {
-    name: 'xterm-256color',
-    cols, rows,
-    cwd,
-    env: process.env,
-  });
-  log(`session ${sid(sessionId)}: spawned ${shell} (${cols}x${rows}) in ${cwd}`);
+// The browser may send a `preset` alongside `start`: { shell, args, cwd, env }
+// chosen from the user's preset library. Anything the preset omits falls back
+// to the device defaults (the --shell override / platform shell, the device
+// cwd). The browser is already trusted with a full shell here, so an arbitrary
+// shell+args is within bounds — but a bad path (a Windows preset on a Linux
+// box) must not crash the agent, so the spawn is guarded.
+function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
+  const shell = (typeof preset?.shell === 'string' && preset.shell.trim()) || pickShell();
+  const args = Array.isArray(preset?.args) ? preset.args.filter(a => typeof a === 'string') : [];
+  let cwd = resolveCwd();
+  if (typeof preset?.cwd === 'string' && preset.cwd) {
+    if (existsSync(preset.cwd)) cwd = preset.cwd;
+    else log(`preset folder "${preset.cwd}" does not exist, using ${cwd}`);
+  }
+  let env = process.env;
+  if (preset?.env && typeof preset.env === 'object') {
+    env = { ...process.env };
+    for (const [k, val] of Object.entries(preset.env)) {
+      if (typeof k === 'string' && k) env[k] = String(val);
+    }
+  }
+  try {
+    conn.pty = pty.spawn(shell, args, {
+      name: 'xterm-256color',
+      cols, rows,
+      cwd,
+      env,
+    });
+  } catch (err) {
+    log(`session ${sid(sessionId)}: spawn failed for ${shell}: ${err.message}`);
+    if (conn.dc?.readyState === 'open') {
+      conn.dc.send(JSON.stringify({ type: 'exit', code: -1, error: `couldn't start ${shell}: ${err.message}` }));
+    }
+    closeConn(sessionId, 'spawn failed');
+    return;
+  }
+  log(`session ${sid(sessionId)}: spawned ${shell}${args.length ? ' ' + args.join(' ') : ''} (${cols}x${rows}) in ${cwd}`);
   conn.pty.onData(data => {
     const buf = Buffer.from(data, 'utf8');
     bufferOutput(conn, buf);
