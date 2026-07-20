@@ -5,7 +5,8 @@
   "description": "tterm machine-side connector — bridges a browser terminal to a real shell over peer-to-peer WebRTC",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "engines": {
     "node": ">=20"

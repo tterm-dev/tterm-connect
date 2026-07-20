@@ -114,6 +114,30 @@ $env:TTERM_ENDPOINT_URL="<TTERM_ENDPOINT_URL>"; $env:TTERM_TOKEN="<TOKEN>"; node
   Run it as the user (and with the privileges) you actually want the remote
   terminal to have.
 
+## Troubleshooting
+
+**macOS/Linux: sessions die instantly with `spawn failed` / `posix_spawnp failed.`**
+
+node-pty execs a small bundled `spawn-helper` binary to launch your shell. If
+that helper has lost its executable bit — most often because `node_modules` was
+copied or synced from a Windows machine, which doesn't carry Unix permission
+bits — every session fails at spawn.
+
+A fresh `npm install` fixes it automatically (a `postinstall` step restores the
+bit). If you need to fix it by hand:
+
+```bash
+chmod +x node_modules/node-pty/prebuilds/$(node -p 'process.platform + "-" + process.arch')/spawn-helper
+```
+
+Then verify:
+
+```bash
+node -e 'require("node-pty").spawn("/bin/sh",[],{}).onData(d=>process.stdout.write(d))'
+```
+
+A shell prompt (instead of a stack trace) means it's fixed — restart the connector.
+
 ## License
 
 MIT.
