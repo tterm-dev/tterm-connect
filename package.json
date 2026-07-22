@@ -12,8 +12,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "convex": "^1.42.3",
     "node-datachannel": "^0.26.0",
-    "node-pty": "^1.0.0"
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
   }
 }

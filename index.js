@@ -1,19 +1,24 @@
 // tterm-connect: the machine-side agent. Runs on the machine you want to reach.
-// Registers with Convex using a device token, waits for sessions, answers WebRTC
-// offers and bridges the data channel to a real PTY (ConPTY on Windows, forkpty
-// elsewhere). Terminal bytes flow only over the P2P data channel, never through
-// Convex.
+// Holds one WebSocket to the tterm hub (a Cloudflare Worker + Durable Object),
+// authenticated by the sha256 of its device token. The hub pushes `sync`
+// snapshots (live sessions + browser signals); the agent answers WebRTC offers
+// and bridges the data channel to a real PTY (ConPTY on Windows, forkpty
+// elsewhere). Terminal bytes flow only over the P2P data channel, never
+// through the hub.
 //
 // Sessions survive disconnects: when the browser goes away (tab close, network
 // drop) the shell stays alive for GRACE_MS with recent output buffered, and a
 // reattach replays that buffer into the new connection.
-import { ConvexClient } from 'convex/browser';
 import { RTCPeerConnection } from 'node-datachannel/polyfill';
 import pty from 'node-pty';
 import { createHash } from 'crypto';
 import { existsSync } from 'fs';
 import os from 'os';
-import { api } from './api.js';
+
+// Browser-style WebSocket: global on Node >= 22, the `ws` package elsewhere
+// (it exposes the same onopen/onmessage/onclose/onerror surface).
+let WebSocketImpl = globalThis.WebSocket;
+if (!WebSocketImpl) ({ WebSocket: WebSocketImpl } = await import('ws'));
 
 // ---------- config ----------
 function arg(name) {
@@ -24,11 +29,17 @@ const ENDPOINT_URL = arg('endpointUrl') || process.env.TTERM_ENDPOINT_URL;
 const TOKEN = arg('token') || process.env.TTERM_TOKEN;
 const SHELL_OVERRIDE = arg('shell') || process.env.TTERM_SHELL;
 if (!ENDPOINT_URL || !TOKEN) {
-  console.error('usage: node index.js --endpointUrl <endpoint-url> --token <device-token> [--shell <path>]');
+  console.error('usage: node index.js --endpointUrl <tterm-url> --token <device-token> [--shell <path>]');
   console.error('   or: TTERM_ENDPOINT_URL=… TTERM_TOKEN=… node index.js');
   process.exit(1);
 }
 const tokenHash = createHash('sha256').update(TOKEN).digest('hex');
+// --endpointUrl is the app origin (e.g. https://tterm.dev); the agent link is
+// its /agent/ws WebSocket.
+const WS_URL = (() => {
+  const origin = new URL(ENDPOINT_URL).origin.replace(/^http/, 'ws');
+  return `${origin}/agent/ws?tokenHash=${tokenHash}`;
+})();
 
 const GRACE_MS = 15 * 60 * 1000;   // how long a detached shell survives
 const HANDSHAKE_MS = 60 * 1000;    // how long a never-connected session may dangle
@@ -44,8 +55,59 @@ function pickShell() {
 const log = (...args) => console.log(new Date().toISOString().slice(11, 19), ...args);
 const sid = id => id.slice(-6);
 
-// ---------- convex link ----------
-const convex = new ConvexClient(ENDPOINT_URL);
+// ---------- hub link ----------
+// One WebSocket to the hub, reconnecting with backoff. Outbound messages are
+// queued while the link is down (except heartbeats, which are only meaningful
+// live); the hub re-pushes a full sync on every reconnect.
+let hubWs = null;
+let hubQueue = [];
+let hubRetryMs = 1000;
+let announced = false; // greeting logged once, on the first sync
+
+function hubSend(msg) {
+  const data = JSON.stringify(msg);
+  if (hubWs?.readyState === 1) hubWs.send(data);
+  else if (msg.type !== 'heartbeat') hubQueue.push(data);
+}
+
+function connectHub() {
+  const ws = new WebSocketImpl(WS_URL);
+  hubWs = ws;
+  ws.onopen = () => {
+    hubRetryMs = 1000;
+    for (const data of hubQueue.splice(0)) ws.send(data);
+  };
+  ws.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'sync') {
+      if (!announced) {
+        announced = true;
+        log(`tterm-connect online as "${msg.deviceName}" (${os.hostname()}, ${process.platform}), shell: ${pickShell()}`);
+      }
+      onSync(msg);
+    }
+  };
+  ws.onerror = err => {
+    // A rejected upgrade (bad token, deleted device) surfaces as an error
+    // mentioning the HTTP status — no point retrying those.
+    if (/401|403/.test(String(err?.message))) {
+      console.error('registration failed: invalid device token (or device was removed)');
+      process.exit(1);
+    }
+  };
+  ws.onclose = e => {
+    if (hubWs !== ws) return;
+    if (e.code === 4004) {
+      console.error('device was removed in the web UI — shutting down');
+      process.exit(1);
+    }
+    log(`hub link lost, retrying in ${Math.round(hubRetryMs / 1000)}s`);
+    setTimeout(connectHub, hubRetryMs);
+    hubRetryMs = Math.min(hubRetryMs * 2, 30000);
+  };
+}
+
 const STUN = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }] };
 
 // sessionId -> { pc, dc, pty, buffer:[Buffer], bufferSize, openedAt, detachedAt, pcUsed, resetting }
@@ -64,20 +126,10 @@ function resolveCwd() {
 }
 
 async function main() {
-  let name;
-  try {
-    ({ name } = await convex.mutation(api.agent.heartbeat, { tokenHash }));
-  } catch {
-    console.error('registration failed: invalid token or unreachable Convex deployment');
-    process.exit(1);
-  }
-  log(`tterm-connect online as "${name}" (${os.hostname()}, ${process.platform}), shell: ${pickShell()}`);
+  connectHub();
 
-  setInterval(() => {
-    convex.mutation(api.agent.heartbeat, { tokenHash }).catch(err => log('heartbeat failed:', err.message));
-  }, 20000);
-
-  convex.onUpdate(api.agent.sync, { tokenHash }, onSync);
+  // Presence: the UI treats the device as online while heartbeats are recent.
+  setInterval(() => hubSend({ type: 'heartbeat' }), 20000);
 
   // Reap sessions that never completed a handshake, and detached shells whose
   // grace period expired.
@@ -124,7 +176,7 @@ function openConn(sessionId) {
   };
   conns.set(sessionId, conn);
   makePc(conn, sessionId);
-  convex.mutation(api.agent.accept, { tokenHash, sessionId }).catch(() => {});
+  hubSend({ type: 'accept', sessionId });
 }
 
 function makePc(conn, sessionId) {
@@ -147,7 +199,7 @@ function makePc(conn, sessionId) {
       if (!conn.resetting && conn.dc === channel) detachConn(sessionId, 'channel closed');
     };
     conn.detachedAt = null;
-    convex.mutation(api.agent.setAttached, { tokenHash, sessionId, attached: true }).catch(() => {});
+    hubSend({ type: 'setAttached', sessionId, attached: true });
     log(`session ${sid(sessionId)}: data channel open — P2P established`);
   };
 }
@@ -184,7 +236,7 @@ async function handleSignal(conn, sessionId, payload) {
 }
 
 function postSignal(sessionId, payload) {
-  convex.mutation(api.agent.post, { tokenHash, sessionId, payload }).catch(() => {});
+  hubSend({ type: 'signal', sessionId, payload });
 }
 
 function onChannelMessage(conn, sessionId, data) {
@@ -285,7 +337,7 @@ function detachConn(sessionId, reason) {
   try { conn.dc?.close(); } catch { /* already closed */ }
   try { conn.pc?.close(); } catch { /* already closed */ }
   conn.dc = null;
-  convex.mutation(api.agent.setAttached, { tokenHash, sessionId, attached: false }).catch(() => {});
+  hubSend({ type: 'setAttached', sessionId, attached: false });
   log(`session ${sid(sessionId)}: detached (${reason}) — shell kept for ${GRACE_MS / 60000} min`);
 }
 
@@ -297,7 +349,7 @@ function closeConn(sessionId, reason) {
   try { conn.pty?.kill(); } catch { /* already dead */ }
   try { conn.dc?.close(); } catch { /* already closed */ }
   try { conn.pc?.close(); } catch { /* already closed */ }
-  convex.mutation(api.agent.closeSession, { tokenHash, sessionId }).catch(() => {});
+  hubSend({ type: 'closeSession', sessionId });
 }
 
 process.on('SIGINT', () => {
