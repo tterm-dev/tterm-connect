@@ -75,7 +75,62 @@ pm2 save && pm2 startup    # follow the printed instructions to enable at boot
 ```
 
 Native alternatives: **systemd** service on Linux, **launchd** agent on macOS,
-or **Task Scheduler / NSSM** on Windows.
+or a **Windows service** (below).
+
+### 🪟 Windows service
+
+`scripts/` contains a ready-made installer that registers the connector as a
+Windows service (via [winsw](https://github.com/winsw/winsw)), so it starts at
+boot with nobody logged in and restarts itself if it dies.
+
+1. Create `service.config.json` in the repo root (it is gitignored — it holds
+   your token):
+
+   ```json
+   {
+     "serviceName": "tterm-connect",
+     "endpointUrl": "<TTERM_ENDPOINT_URL>",
+     "token": "<TOKEN>",
+     "nodePath": "C:/Program Files/nodejs/node.exe",
+     "accountDomain": "<COMPUTERNAME>",
+     "accountName": "<your-windows-user>"
+   }
+   ```
+
+   `nodePath` pins the interpreter. Point it at a concrete `node.exe` rather
+   than an nvm shim — the shim retargets on `nvm use`, and `node-pty` /
+   `node-datachannel` are native modules built against one ABI.
+
+2. From an **elevated** PowerShell:
+
+   ```powershell
+   .\scripts\service-setup.ps1
+   ```
+
+   It asks for the Windows password of the account in `service.config.json`,
+   grants that account *Log on as a service*, registers the service, sets it to
+   start automatically, and starts it. The password goes to the Service Control
+   Manager (stored in LSA) — it is never written to a file. The endpoint URL and
+   token are passed as environment variables, so they stay out of the process
+   list.
+
+   > A service logon needs the account's real password. A Windows Hello PIN
+   > won't work. To run as the machine instead of as you, remove
+   > `accountDomain`/`accountName` handling by setting the service to
+   > `LocalSystem` in `services.msc` — but note that remote shells then run as
+   > `NT AUTHORITY\SYSTEM`, without your profile, `PATH`, or mapped drives.
+
+3. Managing it:
+
+   ```powershell
+   Get-Service ttermconnect
+   Restart-Service ttermconnect
+   Get-Content .\daemon\ttermconnect.out.log -Tail 50 -Wait
+   .\scripts\service-setup.ps1 -Uninstall
+   ```
+
+Re-running `service-setup.ps1` after editing `service.config.json` regenerates
+the descriptor and reconfigures the existing service in place.
 
 ## Configuration
 

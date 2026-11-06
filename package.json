@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.js",
+    "service:generate": "node scripts/service-generate.js"
   },
   "engines": {
     "node": ">=20"
@@ -15,5 +16,8 @@
     "node-datachannel": "^0.26.0",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "node-windows": "^1.0.0-beta.8"
   }
 }
