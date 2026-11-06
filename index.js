@@ -11,9 +11,12 @@
 // reattach replays that buffer into the new connection.
 import { RTCPeerConnection } from 'node-datachannel/polyfill';
 import pty from 'node-pty';
-import { createHash } from 'crypto';
-import { existsSync } from 'fs';
+import { createHash, randomBytes } from 'crypto';
+import {
+  existsSync, mkdirSync, openSync, writeSync, closeSync, rmSync, readdirSync, statSync,
+} from 'fs';
 import os from 'os';
+import path from 'path';
 
 // Browser-style WebSocket: global on Node >= 22, the `ws` package elsewhere
 // (it exposes the same onopen/onmessage/onclose/onerror surface).
@@ -194,8 +197,10 @@ function makePc(conn, sessionId) {
   pc.ondatachannel = ({ channel }) => {
     conn.dc = channel;
     channel.binaryType = 'arraybuffer';
-    channel.onmessage = e => onChannelMessage(conn, sessionId, e.data);
+    channel.uploads = new Map(); // in-flight file uploads on this channel (see onUpload)
+    channel.onmessage = e => onChannelMessage(conn, sessionId, e.data, channel);
     channel.onclose = () => {
+      abortUploads(channel);
       if (!conn.resetting && conn.dc === channel) detachConn(sessionId, 'channel closed');
     };
     conn.detachedAt = null;
@@ -239,10 +244,14 @@ function postSignal(sessionId, payload) {
   hubSend({ type: 'signal', sessionId, payload });
 }
 
-function onChannelMessage(conn, sessionId, data) {
+function onChannelMessage(conn, sessionId, data, channel) {
   if (typeof data === 'string') {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
+    if (typeof msg.type === 'string' && msg.type.startsWith('upload-')) {
+      onUpload(channel, sessionId, msg);
+      return;
+    }
     if (msg.type === 'start') {
       if (conn.pty) {
         // Reattach: bring the browser up to date, then adopt its size.
@@ -260,6 +269,97 @@ function onChannelMessage(conn, sessionId, data) {
   }
   if (conn.pty) conn.pty.write(Buffer.from(data).toString('utf8'));
 }
+
+// ---------- file uploads (a file pasted or dropped in the browser) ----------
+// The browser can't hand its clipboard to a program on this machine, so it
+// sends the file over the data channel — JSON messages with base64 chunks:
+//   upload-start {id, name, size}  →  upload-ready {id}
+//   upload-chunk {id, data}        (repeated)
+//   upload-end   {id}              →  upload-done {id, path}
+// Any failure answers upload-error {id, error}. We save the file to a temp
+// folder and the browser pastes the saved path into the terminal: Claude Code,
+// for one, attaches an image when it sees its path. Files expire after a day.
+const UPLOAD_DIR = path.join(os.tmpdir(), 'tterm-uploads');
+const UPLOAD_MAX = 100 * 1024 * 1024;
+const UPLOAD_TTL_MS = 24 * 3600 * 1000;
+
+function sendJson(channel, msg) {
+  if (channel?.readyState === 'open') channel.send(JSON.stringify(msg));
+}
+
+// The browser's file name, made safe for a path: no folders, no odd characters.
+function safeName(name) {
+  const base = path.basename(String(name || '')).replace(/[^\w.\-]+/g, '_').replace(/^\.+/, '');
+  return base.slice(-80) || 'file';
+}
+
+function onUpload(channel, sessionId, msg) {
+  const id = String(msg.id ?? '').slice(0, 64);
+  const fail = err => {
+    abortUpload(channel, id);
+    sendJson(channel, { type: 'upload-error', id, error: err });
+  };
+  if (msg.type === 'upload-start') {
+    const size = Number(msg.size);
+    if (!id || channel.uploads.has(id)) return fail('bad upload id');
+    if (!Number.isSafeInteger(size) || size < 0 || size > UPLOAD_MAX) return fail('file is too large');
+    try {
+      mkdirSync(UPLOAD_DIR, { recursive: true });
+      const file = path.join(UPLOAD_DIR, `${Date.now()}-${randomBytes(3).toString('hex')}-${safeName(msg.name)}`);
+      channel.uploads.set(id, { file, fd: openSync(file, 'wx'), size, received: 0 });
+    } catch (err) {
+      return fail(err.message);
+    }
+    sendJson(channel, { type: 'upload-ready', id });
+    return;
+  }
+  const up = channel.uploads.get(id);
+  if (!up) return;
+  if (msg.type === 'upload-chunk') {
+    const buf = Buffer.from(String(msg.data ?? ''), 'base64');
+    if (up.received + buf.length > up.size) return fail('more data than announced');
+    try { writeSync(up.fd, buf); } catch (err) { return fail(err.message); }
+    up.received += buf.length;
+  } else if (msg.type === 'upload-end') {
+    if (up.received !== up.size) return fail('upload is incomplete');
+    channel.uploads.delete(id);
+    try { closeSync(up.fd); } catch (err) {
+      rmSync(up.file, { force: true });
+      return sendJson(channel, { type: 'upload-error', id, error: err.message });
+    }
+    log(`session ${sid(sessionId)}: saved upload ${up.file} (${up.size} bytes)`);
+    sendJson(channel, { type: 'upload-done', id, path: up.file });
+  } else if (msg.type === 'upload-abort') {
+    abortUpload(channel, id);
+  }
+}
+
+// Drop a partial upload: close and delete its file.
+function abortUpload(channel, id) {
+  const up = channel?.uploads?.get(id);
+  if (!up) return;
+  channel.uploads.delete(id);
+  try { closeSync(up.fd); } catch { /* already closed */ }
+  rmSync(up.file, { force: true });
+}
+
+function abortUploads(channel) {
+  for (const id of [...(channel?.uploads?.keys() ?? [])]) abortUpload(channel, id);
+}
+
+// Delete uploads older than UPLOAD_TTL_MS (at start, then hourly).
+function sweepUploads() {
+  let names;
+  try { names = readdirSync(UPLOAD_DIR); } catch { return; } // no folder yet
+  for (const name of names) {
+    const file = path.join(UPLOAD_DIR, name);
+    try {
+      if (Date.now() - statSync(file).mtimeMs > UPLOAD_TTL_MS) rmSync(file, { force: true });
+    } catch { /* gone or busy: next sweep */ }
+  }
+}
+sweepUploads();
+setInterval(sweepUploads, 3600 * 1000).unref();
 
 function bufferOutput(conn, buf) {
   conn.buffer.push(buf);
