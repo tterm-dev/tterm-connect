@@ -44,7 +44,9 @@ const WS_URL = (() => {
   return `${origin}/agent/ws?tokenHash=${tokenHash}`;
 })();
 
-const GRACE_MS = 15 * 60 * 1000;   // how long a detached shell survives
+// A detached shell lives until the user closes it. Only hidden pre-warmed
+// spares expire: their browser is gone, and nobody would ever close them.
+const SPARE_GRACE_MS = 15 * 60 * 1000; // how long a detached spare survives
 const HANDSHAKE_MS = 60 * 1000;    // how long a never-connected session may dangle
 const BUFFER_MAX = 256 * 1024;     // replay buffer per session (bytes)
 const CHUNK = 16 * 1024;           // replay chunk size over the data channel
@@ -134,15 +136,15 @@ async function main() {
   // Presence: the UI treats the device as online while heartbeats are recent.
   setInterval(() => hubSend({ type: 'heartbeat' }), 20000);
 
-  // Reap sessions that never completed a handshake, and detached shells whose
+  // Reap sessions that never completed a handshake, and detached spares whose
   // grace period expired.
   setInterval(() => {
     const now = Date.now();
     for (const [sessionId, conn] of conns) {
       if (!conn.pty && conn.pc?.connectionState !== 'connected' && now - conn.openedAt > HANDSHAKE_MS) {
         closeConn(sessionId, 'handshake timeout');
-      } else if (conn.pty && conn.detachedAt && now - conn.detachedAt > GRACE_MS) {
-        closeConn(sessionId, 'detach grace expired');
+      } else if (conn.hidden && conn.pty && conn.detachedAt && now - conn.detachedAt > SPARE_GRACE_MS) {
+        closeConn(sessionId, 'detached spare expired');
       }
     }
   }, 15000);
@@ -159,6 +161,8 @@ async function onSync({ sessions, signals, cwd }) {
 
   for (const session of sessions) {
     if (!conns.has(session.id)) openConn(session.id);
+    // An older hub sends no `hidden`: treat the session as real (never expires).
+    conns.get(session.id).hidden = session.hidden === true;
   }
 
   for (const signal of signals) {
@@ -438,7 +442,8 @@ function detachConn(sessionId, reason) {
   try { conn.pc?.close(); } catch { /* already closed */ }
   conn.dc = null;
   hubSend({ type: 'setAttached', sessionId, attached: false });
-  log(`session ${sid(sessionId)}: detached (${reason}) — shell kept for ${GRACE_MS / 60000} min`);
+  log(`session ${sid(sessionId)}: detached (${reason}) — ${conn.hidden
+    ? `spare kept for ${SPARE_GRACE_MS / 60000} min` : 'shell kept until closed'}`);
 }
 
 function closeConn(sessionId, reason) {
