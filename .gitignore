@@ -2,3 +2,4 @@ node_modules/
 daemon/
 service.config.json
 *.log
+state/

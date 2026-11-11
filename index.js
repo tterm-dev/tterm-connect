@@ -7,16 +7,23 @@
 // through the hub.
 //
 // Sessions survive disconnects: when the browser goes away (tab close, network
-// drop) the shell stays alive for GRACE_MS with recent output buffered, and a
-// reattach replays that buffer into the new connection.
+// drop) the shell stays alive with recent output buffered, and a reattach
+// replays that buffer into the new connection.
+//
+// Sessions also survive a connector restart (service restart, crash, reboot),
+// but only in part: the buffered output and the shell's start settings are
+// saved to STATE_DIR. A running process cannot be saved, so on reattach the
+// agent shows the saved output and starts a new shell with the same settings.
 import { RTCPeerConnection } from 'node-datachannel/polyfill';
 import pty from 'node-pty';
 import { createHash, randomBytes } from 'crypto';
 import {
   existsSync, mkdirSync, openSync, writeSync, closeSync, rmSync, readdirSync, statSync,
+  readFileSync, writeFileSync, renameSync,
 } from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 // Browser-style WebSocket: global on Node >= 22, the `ws` package elsewhere
 // (it exposes the same onopen/onmessage/onclose/onerror surface).
@@ -50,6 +57,11 @@ const SPARE_GRACE_MS = 15 * 60 * 1000; // how long a detached spare survives
 const HANDSHAKE_MS = 60 * 1000;    // how long a never-connected session may dangle
 const BUFFER_MAX = 256 * 1024;     // replay buffer per session (bytes)
 const CHUNK = 16 * 1024;           // replay chunk size over the data channel
+// Saved sessions: <id>.json (start settings) + <id>.log (output buffer). Next
+// to index.js, not in the home folder: a service account's home is a system path.
+const STATE_DIR = process.env.TTERM_STATE_DIR
+  || path.join(path.dirname(fileURLToPath(import.meta.url)), 'state');
+const FLUSH_MS = 2000;             // how often changed buffers go to disk
 
 function pickShell() {
   if (SHELL_OVERRIDE) return SHELL_OVERRIDE;
@@ -141,13 +153,73 @@ async function main() {
   setInterval(() => {
     const now = Date.now();
     for (const [sessionId, conn] of conns) {
-      if (!conn.pty && conn.pc?.connectionState !== 'connected' && now - conn.openedAt > HANDSHAKE_MS) {
+      // A restored session waits for its browser as long as a live one would.
+      if (!conn.pty && !conn.restored && conn.pc?.connectionState !== 'connected'
+          && now - conn.openedAt > HANDSHAKE_MS) {
         closeConn(sessionId, 'handshake timeout');
       } else if (conn.hidden && conn.pty && conn.detachedAt && now - conn.detachedAt > SPARE_GRACE_MS) {
         closeConn(sessionId, 'detached spare expired');
       }
     }
   }, 15000);
+
+  setInterval(flushState, FLUSH_MS);
+}
+
+// ---------- saved sessions (survive a connector restart) ----------
+// Only real sessions are saved; a hidden spare has no history worth keeping.
+function statePath(sessionId, ext) {
+  return path.join(STATE_DIR, `${sessionId.replace(/[^\w.-]/g, '_')}.${ext}`);
+}
+
+function writeAtomic(file, data) {
+  writeFileSync(`${file}.tmp`, data);
+  renameSync(`${file}.tmp`, file);
+}
+
+function flushState() {
+  for (const [sessionId, conn] of conns) {
+    if (!conn.pty || conn.hidden || !conn.spawnInfo) continue;
+    try {
+      mkdirSync(STATE_DIR, { recursive: true });
+      if (!conn.metaSaved) {
+        writeAtomic(statePath(sessionId, 'json'), JSON.stringify(conn.spawnInfo));
+        conn.metaSaved = true;
+      }
+      if (conn.dirty) {
+        writeAtomic(statePath(sessionId, 'log'), Buffer.concat(conn.buffer));
+        conn.dirty = false;
+      }
+    } catch (err) {
+      log(`session ${sid(sessionId)}: could not save state: ${err.message}`);
+    }
+  }
+}
+
+function loadState(sessionId) {
+  try {
+    const spawnInfo = JSON.parse(readFileSync(statePath(sessionId, 'json'), 'utf8'));
+    let output = Buffer.alloc(0);
+    try { output = readFileSync(statePath(sessionId, 'log')); } catch { /* no output yet */ }
+    return { spawnInfo, output };
+  } catch {
+    return null;
+  }
+}
+
+function dropState(sessionId) {
+  rmSync(statePath(sessionId, 'json'), { force: true });
+  rmSync(statePath(sessionId, 'log'), { force: true });
+}
+
+// Saved state of sessions the hub no longer has (closed while we were down).
+function sweepState(liveIds) {
+  let names;
+  try { names = readdirSync(STATE_DIR); } catch { return; } // no folder yet
+  for (const name of names) {
+    const id = name.replace(/\.(json|log)(\.tmp)?$/, '');
+    if (!liveIds.has(id)) rmSync(path.join(STATE_DIR, name), { force: true });
+  }
 }
 
 async function onSync({ sessions, signals, cwd }) {
@@ -159,8 +231,21 @@ async function onSync({ sessions, signals, cwd }) {
     if (!liveIds.has(sessionId)) closeConn(sessionId, 'closed remotely');
   }
 
+  sweepState(liveIds);
+
   for (const session of sessions) {
-    if (!conns.has(session.id)) openConn(session.id);
+    if (!conns.has(session.id)) {
+      // An accepted session we don't hold lost its shell when this process
+      // restarted. Restore it from disk, or close it so the UI does not show
+      // a dead shell as live.
+      const restored = session.status === 'pending' ? null : loadState(session.id);
+      if (session.status !== 'pending' && !restored) {
+        log(`session ${sid(session.id)}: shell lost in a restart, nothing saved — closing`);
+        hubSend({ type: 'closeSession', sessionId: session.id });
+        continue;
+      }
+      openConn(session.id, restored);
+    }
     // An older hub sends no `hidden`: treat the session as real (never expires).
     conns.get(session.id).hidden = session.hidden === true;
   }
@@ -173,13 +258,14 @@ async function onSync({ sessions, signals, cwd }) {
   }
 }
 
-function openConn(sessionId) {
-  log(`session ${sid(sessionId)}: incoming`);
+function openConn(sessionId, restored = null) {
+  log(`session ${sid(sessionId)}: ${restored ? 'restored from disk, waiting for browser' : 'incoming'}`);
   const conn = {
     pc: null, dc: null, pty: null,
     buffer: [], bufferSize: 0,
     openedAt: Date.now(), detachedAt: null,
     pcUsed: false, resetting: false,
+    restored, spawnInfo: null, metaSaved: false, dirty: false,
   };
   conns.set(sessionId, conn);
   makePc(conn, sessionId);
@@ -259,9 +345,22 @@ function onChannelMessage(conn, sessionId, data, channel) {
     if (msg.type === 'start') {
       if (conn.pty) {
         // Reattach: bring the browser up to date, then adopt its size.
-        replayBuffer(conn);
+        replayBuffer(conn, sessionId);
         try { conn.pty.resize(msg.cols, msg.rows); } catch { /* racing exit */ }
         log(`session ${sid(sessionId)}: replayed ${conn.bufferSize} buffered bytes`);
+      } else if (conn.restored) {
+        // After a connector restart: show the saved output, push it into
+        // scrollback (a new ConPTY clears the screen), then start a new shell
+        // with the old settings. The browser's own preset is ignored here.
+        const { spawnInfo, output } = conn.restored;
+        conn.restored = null;
+        bufferOutput(conn, output);
+        bufferOutput(conn, Buffer.from(
+          '\r\n\x1b[0;2m[tterm: the connector restarted — this is a new shell; the output above is saved history]\x1b[0m'
+          + '\r\n'.repeat(Math.max(1, msg.rows | 0))));
+        replayBuffer(conn, sessionId);
+        log(`session ${sid(sessionId)}: replayed ${conn.bufferSize} saved bytes, starting a new shell`);
+        spawnPty(conn, sessionId, msg.cols, msg.rows, { ...spawnInfo.preset, cwd: spawnInfo.cwd });
       } else {
         spawnPty(conn, sessionId, msg.cols, msg.rows, msg.preset);
       }
@@ -288,7 +387,23 @@ const UPLOAD_MAX = 100 * 1024 * 1024;
 const UPLOAD_TTL_MS = 24 * 3600 * 1000;
 
 function sendJson(channel, msg) {
-  if (channel?.readyState === 'open') channel.send(JSON.stringify(msg));
+  if (channel?.readyState !== 'open') return;
+  try { channel.send(JSON.stringify(msg)); } catch { /* channel dying; onclose detaches */ }
+}
+
+// Send on a session's data channel. A dying channel can still report 'open'
+// and then throw (libdatachannel errno=108); before this guard, that uncaught
+// throw killed the agent and every shell with it. Treat it as a lost link.
+function safeSend(conn, sessionId, data) {
+  if (conn.dc?.readyState !== 'open') return false;
+  try {
+    conn.dc.send(data);
+    return true;
+  } catch (err) {
+    log(`session ${sid(sessionId)}: send failed (${err.message})`);
+    detachConn(sessionId, 'send failed');
+    return false;
+  }
 }
 
 // The browser's file name, made safe for a path: no folders, no odd characters.
@@ -368,16 +483,17 @@ setInterval(sweepUploads, 3600 * 1000).unref();
 function bufferOutput(conn, buf) {
   conn.buffer.push(buf);
   conn.bufferSize += buf.length;
+  conn.dirty = true;
   while (conn.bufferSize > BUFFER_MAX && conn.buffer.length > 1) {
     conn.bufferSize -= conn.buffer.shift().length;
   }
 }
 
-function replayBuffer(conn) {
+function replayBuffer(conn, sessionId) {
   if (conn.dc?.readyState !== 'open' || conn.bufferSize === 0) return;
   const all = Buffer.concat(conn.buffer);
   for (let i = 0; i < all.length; i += CHUNK) {
-    conn.dc.send(all.subarray(i, Math.min(i + CHUNK, all.length)));
+    if (!safeSend(conn, sessionId, all.subarray(i, Math.min(i + CHUNK, all.length)))) return;
   }
 }
 
@@ -411,31 +527,32 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
     });
   } catch (err) {
     log(`session ${sid(sessionId)}: spawn failed for ${shell}: ${err.message}`);
-    if (conn.dc?.readyState === 'open') {
-      conn.dc.send(JSON.stringify({ type: 'exit', code: -1, error: `couldn't start ${shell}: ${err.message}` }));
-    }
+    safeSend(conn, sessionId, JSON.stringify({ type: 'exit', code: -1, error: `couldn't start ${shell}: ${err.message}` }));
     closeConn(sessionId, 'spawn failed');
     return;
   }
+  // What a restore after a connector restart needs to start the same shell.
+  conn.spawnInfo = { preset: { shell, args, env: preset?.env ?? null }, cwd };
+  conn.metaSaved = false;
   log(`session ${sid(sessionId)}: spawned ${shell}${args.length ? ' ' + args.join(' ') : ''} (${cols}x${rows}) in ${cwd}`);
   conn.pty.onData(data => {
     const buf = Buffer.from(data, 'utf8');
     bufferOutput(conn, buf);
-    if (conn.dc?.readyState === 'open') conn.dc.send(buf);
+    safeSend(conn, sessionId, buf);
   });
   conn.pty.onExit(({ exitCode }) => {
     log(`session ${sid(sessionId)}: shell exited (${exitCode})`);
-    if (conn.dc?.readyState === 'open') conn.dc.send(JSON.stringify({ type: 'exit', code: exitCode }));
+    safeSend(conn, sessionId, JSON.stringify({ type: 'exit', code: exitCode }));
     conn.pty = null;
     closeConn(sessionId, 'shell exit');
   });
 }
 
-// Connection lost but shell (if any) stays alive for GRACE_MS awaiting reattach.
+// Connection lost but the shell (or a restored session) stays, awaiting reattach.
 function detachConn(sessionId, reason) {
   const conn = conns.get(sessionId);
   if (!conn) return;
-  if (!conn.pty) return closeConn(sessionId, reason);
+  if (!conn.pty && !conn.restored) return closeConn(sessionId, reason);
   if (conn.detachedAt) return; // already detached
   conn.detachedAt = Date.now();
   try { conn.dc?.close(); } catch { /* already closed */ }
@@ -454,13 +571,24 @@ function closeConn(sessionId, reason) {
   try { conn.pty?.kill(); } catch { /* already dead */ }
   try { conn.dc?.close(); } catch { /* already closed */ }
   try { conn.pc?.close(); } catch { /* already closed */ }
+  dropState(sessionId);
   hubSend({ type: 'closeSession', sessionId });
 }
 
+// Shutdown keeps the sessions: save their output, kill the shells, and leave
+// the hub rows in place so the next start can restore them.
 process.on('SIGINT', () => {
-  log('shutting down…');
-  for (const sessionId of [...conns.keys()]) closeConn(sessionId, 'agent shutdown');
+  log('shutting down — sessions are saved for the next start');
+  flushState();
+  for (const conn of conns.values()) {
+    try { conn.pty?.kill(); } catch { /* already dead */ }
+  }
   process.exit(0);
+});
+
+// Last line of defence: one bad session must not take every shell down.
+process.on('uncaughtException', err => {
+  log('uncaught error (agent keeps running):', err?.stack || err);
 });
 
 main();
