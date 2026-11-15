@@ -163,7 +163,8 @@ $env:TTERM_ENDPOINT_URL="<TTERM_ENDPOINT_URL>"; $env:TTERM_TOKEN="<TOKEN>"; node
   leaks, remove the server in the web app (that revokes the token) and add it
   again for a fresh one.
 - Shells **survive disconnects**: close the browser tab and the shell stays
-  alive, with recent output buffered, until you close it in the web app — so
+  alive, with recent output buffered (1 MB per shell; a preset can set
+  1–32 MB), until you close it in the web app — so
   reconnecting (from any machine) drops you right back where you were. A
   restart of the connector or the machine still ends all shells.
 - The connector inherits the environment and permissions of whoever runs it.

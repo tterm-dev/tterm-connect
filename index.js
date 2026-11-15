@@ -55,7 +55,15 @@ const WS_URL = (() => {
 // spares expire: their browser is gone, and nobody would ever close them.
 const SPARE_GRACE_MS = 15 * 60 * 1000; // how long a detached spare survives
 const HANDSHAKE_MS = 60 * 1000;    // how long a never-connected session may dangle
-const BUFFER_MAX = 256 * 1024;     // replay buffer per session (bytes)
+// Replay buffer per session: the output a reattach (page refresh, lost link)
+// gets back. A preset can ask for more or less (`bufferBytes` in its spec).
+const BUFFER_DEFAULT = 1024 * 1024;
+const BUFFER_MIN = 64 * 1024;
+const BUFFER_LIMIT = 32 * 1024 * 1024;
+const bufferMaxFor = preset => {
+  const n = Number(preset?.bufferBytes);
+  return Number.isSafeInteger(n) && n > 0 ? Math.min(BUFFER_LIMIT, Math.max(BUFFER_MIN, n)) : BUFFER_DEFAULT;
+};
 const CHUNK = 16 * 1024;           // replay chunk size over the data channel
 // Saved sessions: <id>.json (start settings) + <id>.log (output buffer). Next
 // to index.js, not in the home folder: a service account's home is a system path.
@@ -262,7 +270,7 @@ function openConn(sessionId, restored = null) {
   log(`session ${sid(sessionId)}: ${restored ? 'restored from disk, waiting for browser' : 'incoming'}`);
   const conn = {
     pc: null, dc: null, pty: null,
-    buffer: [], bufferSize: 0,
+    buffer: [], bufferSize: 0, bufferMax: BUFFER_DEFAULT,
     openedAt: Date.now(), detachedAt: null,
     pcUsed: false, resetting: false,
     restored, spawnInfo: null, metaSaved: false, dirty: false,
@@ -354,6 +362,7 @@ function onChannelMessage(conn, sessionId, data, channel) {
         // with the old settings. The browser's own preset is ignored here.
         const { spawnInfo, output } = conn.restored;
         conn.restored = null;
+        conn.bufferMax = bufferMaxFor(spawnInfo.preset);
         bufferOutput(conn, output);
         bufferOutput(conn, Buffer.from(
           '\r\n\x1b[0;2m[tterm: the connector restarted — this is a new shell; the output above is saved history]\x1b[0m'
@@ -484,7 +493,7 @@ function bufferOutput(conn, buf) {
   conn.buffer.push(buf);
   conn.bufferSize += buf.length;
   conn.dirty = true;
-  while (conn.bufferSize > BUFFER_MAX && conn.buffer.length > 1) {
+  while (conn.bufferSize > conn.bufferMax && conn.buffer.length > 1) {
     conn.bufferSize -= conn.buffer.shift().length;
   }
 }
@@ -497,7 +506,7 @@ function replayBuffer(conn, sessionId) {
   }
 }
 
-// The browser may send a `preset` alongside `start`: { shell, args, cwd, env }
+// The browser may send a `preset` alongside `start`: { shell, args, cwd, env, bufferBytes }
 // chosen from the user's preset library. Anything the preset omits falls back
 // to the device defaults (the --shell override / platform shell, the device
 // cwd). The browser is already trusted with a full shell here, so an arbitrary
@@ -531,8 +540,9 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
     closeConn(sessionId, 'spawn failed');
     return;
   }
+  conn.bufferMax = bufferMaxFor(preset);
   // What a restore after a connector restart needs to start the same shell.
-  conn.spawnInfo = { preset: { shell, args, env: preset?.env ?? null }, cwd };
+  conn.spawnInfo = { preset: { shell, args, env: preset?.env ?? null, bufferBytes: conn.bufferMax }, cwd };
   conn.metaSaved = false;
   log(`session ${sid(sessionId)}: spawned ${shell}${args.length ? ' ' + args.join(' ') : ''} (${cols}x${rows}) in ${cwd}`);
   conn.pty.onData(data => {
