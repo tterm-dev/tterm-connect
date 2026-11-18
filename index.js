@@ -16,7 +16,7 @@
 // agent shows the saved output and starts a new shell with the same settings.
 import { RTCPeerConnection } from 'node-datachannel/polyfill';
 import pty from 'node-pty';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import {
   existsSync, mkdirSync, openSync, writeSync, closeSync, rmSync, readdirSync, statSync,
   readFileSync, writeFileSync, renameSync,
@@ -538,9 +538,13 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
     if (existsSync(preset.cwd)) cwd = preset.cwd;
     else log(`preset folder "${preset.cwd}" does not exist, using ${cwd}`);
   }
-  let env = process.env;
+  const env = { ...process.env };
+  // Windows apps send ESC[3J (clear scrollback) only to a terminal they know
+  // handles VT, and Windows Terminal is the one they look for: Claude Code's
+  // /rewind and /clear wipe the screen but left the old chat in scrollback.
+  // The browser's xterm handles ESC[3J, and ConPTY passes it through.
+  if (process.platform === 'win32' && !env.WT_SESSION) env.WT_SESSION = randomUUID();
   if (preset?.env && typeof preset.env === 'object') {
-    env = { ...process.env };
     for (const [k, val] of Object.entries(preset.env)) {
       if (typeof k === 'string' && k) env[k] = String(val);
     }
