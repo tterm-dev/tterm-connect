@@ -24,6 +24,11 @@ import {
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+
+// node-pty older than 1.1 ignores useConptyDll (see spawnPty) without an
+// error, so the start-up log shows the version: an old one needs `npm install`.
+const PTY_VERSION = createRequire(import.meta.url)('node-pty/package.json').version;
 
 // Browser-style WebSocket: global on Node >= 22, the `ws` package elsewhere
 // (it exposes the same onopen/onmessage/onclose/onerror surface).
@@ -108,7 +113,7 @@ function connectHub() {
     if (msg.type === 'sync') {
       if (!announced) {
         announced = true;
-        log(`tterm-connect online as "${msg.deviceName}" (${os.hostname()}, ${process.platform}), shell: ${pickShell()}`);
+        log(`tterm-connect online as "${msg.deviceName}" (${os.hostname()}, ${process.platform}), shell: ${pickShell()}, node-pty ${PTY_VERSION}`);
       }
       onSync(msg);
     }
