@@ -19,8 +19,9 @@ import pty from 'node-pty';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import {
   existsSync, mkdirSync, openSync, writeSync, closeSync, rmSync, readdirSync, statSync,
-  readFileSync, writeFileSync, renameSync,
+  readFileSync, writeFileSync, renameSync, readlinkSync,
 } from 'fs';
+import { execFile } from 'child_process';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -364,6 +365,11 @@ function onChannelMessage(conn, sessionId, data, channel) {
   if (typeof data === 'string') {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
+    if (msg.type === 'upload-where') {
+      const id = String(msg.id ?? '').slice(0, 64);
+      shellCwd(conn).then(dir => sendJson(channel, { type: 'upload-where', id, dir }));
+      return;
+    }
     if (typeof msg.type === 'string' && msg.type.startsWith('upload-')) {
       onUpload(channel, sessionId, msg);
       return;
@@ -403,12 +409,15 @@ function onChannelMessage(conn, sessionId, data, channel) {
 // ---------- file uploads (a file pasted or dropped in the browser) ----------
 // The browser can't hand its clipboard to a program on this machine, so it
 // sends the file over the data channel — JSON messages with base64 chunks:
-//   upload-start {id, name, size}  →  upload-ready {id}
+//   upload-where {id}              →  upload-where {id, dir}  (the shell's folder)
+//   upload-start {id, name, size, dir?}  →  upload-ready {id}
 //   upload-chunk {id, data}        (repeated)
 //   upload-end   {id}              →  upload-done {id, path}
-// Any failure answers upload-error {id, error}. We save the file to a temp
-// folder and the browser pastes the saved path into the terminal: Claude Code,
-// for one, attaches an image when it sees its path. Files expire after a day.
+// Any failure answers upload-error {id, error}. Without `dir` we save the file
+// to a temp folder (files expire after a day); with `dir` (the folder that
+// upload-where gave) we save it there under its own name. The browser pastes
+// the saved path into the terminal: Claude Code, for one, attaches an image
+// when it sees its path.
 const UPLOAD_DIR = path.join(os.tmpdir(), 'tterm-uploads');
 const UPLOAD_MAX = 100 * 1024 * 1024;
 const UPLOAD_TTL_MS = 24 * 3600 * 1000;
@@ -439,6 +448,25 @@ function safeName(name) {
   return base.slice(-80) || 'file';
 }
 
+// A file saved into the user's own folder keeps its name (Cyrillic, spaces):
+// remove only what no file name can hold.
+function plainName(name) {
+  const base = String(name || '').split(/[\\/]/).pop()
+    .replace(/[<>:"|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').trim();
+  return base.slice(-120) || 'file';
+}
+
+// Open dir/name for writing, never over an existing file: photo.png, then
+// photo-1.png, photo-2.png…
+function openFree(dir, name) {
+  const ext = path.extname(name), stem = name.slice(0, name.length - ext.length);
+  for (let n = 0; ; n++) {
+    const file = path.join(dir, n ? `${stem}-${n}${ext}` : name);
+    try { return { file, fd: openSync(file, 'wx') }; }
+    catch (err) { if (err.code !== 'EEXIST' || n >= 999) throw err; }
+  }
+}
+
 function onUpload(channel, sessionId, msg) {
   const id = String(msg.id ?? '').slice(0, 64);
   const fail = err => {
@@ -450,9 +478,17 @@ function onUpload(channel, sessionId, msg) {
     if (!id || channel.uploads.has(id)) return fail('bad upload id');
     if (!Number.isSafeInteger(size) || size < 0 || size > UPLOAD_MAX) return fail('file is too large');
     try {
-      mkdirSync(UPLOAD_DIR, { recursive: true });
-      const file = path.join(UPLOAD_DIR, `${Date.now()}-${randomBytes(3).toString('hex')}-${safeName(msg.name)}`);
-      channel.uploads.set(id, { file, fd: openSync(file, 'wx'), size, received: 0 });
+      let file, fd;
+      if (msg.dir != null) {
+        const dir = String(msg.dir);
+        if (!path.isAbsolute(dir) || !statSync(dir).isDirectory()) return fail(`no folder ${dir}`);
+        ({ file, fd } = openFree(dir, plainName(msg.name)));
+      } else {
+        mkdirSync(UPLOAD_DIR, { recursive: true });
+        file = path.join(UPLOAD_DIR, `${Date.now()}-${randomBytes(3).toString('hex')}-${safeName(msg.name)}`);
+        fd = openSync(file, 'wx');
+      }
+      channel.uploads.set(id, { file, fd, size, received: 0 });
     } catch (err) {
       return fail(err.message);
     }
@@ -506,6 +542,104 @@ function sweepUploads() {
 }
 sweepUploads();
 setInterval(sweepUploads, 3600 * 1000).unref();
+
+// ---------- the shell's current folder (for "save the file here") ----------
+// The program the user works in is usually the shell's newest child (Claude
+// Code started from the prompt), and its working folder is where it was
+// started. With no child, the folder the shell itself reported (OSC 7 or
+// OSC 9;9 from its prompt), then the shell's own working folder. PowerShell's
+// cd does not change its process folder, so a bare pwsh prompt without OSC
+// reporting gives the folder it started in.
+async function shellCwd(conn) {
+  const pid = conn.pty?.pid;
+  let procs = [];
+  if (pid) {
+    try { procs = await procCwds(pid); }
+    catch (err) { log(`could not read the shell's folder: ${err.message}`); }
+  }
+  const [shell, ...children] = procs;
+  const child = children.filter(p => p.cwd).sort((a, b) => b.start - a.start)[0];
+  return child?.cwd || conn.reportedCwd || shell?.cwd || conn.spawnInfo?.cwd || os.homedir();
+}
+
+const run = (cmd, args) => new Promise((resolve, reject) => {
+  execFile(cmd, args, { encoding: 'utf8', windowsHide: true, timeout: 5000 },
+    (err, stdout) => (err ? reject(err) : resolve(stdout)));
+});
+
+// [{pid, start, cwd}] for the shell first, then its direct children.
+async function procCwds(pid) {
+  if (process.platform === 'win32') {
+    const out = await run(await cwdHelper(), [String(pid)]);
+    return out.split(/\r?\n/).filter(Boolean).map(line => {
+      const [p, start, cwd = ''] = line.split('\t');
+      return { pid: Number(p), start: Number(start), cwd };
+    });
+  }
+  if (process.platform === 'linux') {
+    const info = p => {
+      try {
+        const stat = readFileSync(`/proc/${p}/stat`, 'utf8');
+        const start = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+        return { pid: p, start, cwd: readlinkSync(`/proc/${p}/cwd`) };
+      } catch { return { pid: p, start: 0, cwd: '' }; }
+    };
+    let kids = [];
+    try { kids = readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number); }
+    catch { /* kernel without the children file */ }
+    return [info(pid), ...kids.map(info)];
+  }
+  // macOS and others: pgrep for the children, lsof for the folders. A higher
+  // pid stands in for "started later".
+  const kids = (await run('pgrep', ['-P', String(pid)]).catch(() => '')).split(/\s+/).filter(Boolean).map(Number);
+  const out = await run('lsof', ['-a', '-d', 'cwd', '-Fpn', '-p', [pid, ...kids].join(',')]).catch(() => '');
+  const cwds = new Map();
+  let cur = 0;
+  for (const line of out.split('\n')) {
+    if (line[0] === 'p') cur = Number(line.slice(1));
+    else if (line[0] === 'n') cwds.set(cur, line.slice(1));
+  }
+  return [pid, ...kids].map(p => ({ pid: p, start: p, cwd: cwds.get(p) || '' }));
+}
+
+// Windows has no command that prints another process's folder, so a small C#
+// helper (scripts/cwd-helper.cs) does it. It is compiled on first use with the
+// csc.exe that ships with .NET Framework 4 (in every Windows 10/11), into the
+// temp folder, under a name that changes when the source changes.
+let cwdHelperExe = null;
+function cwdHelper() {
+  cwdHelperExe ??= (async () => {
+    const src = path.join(path.dirname(fileURLToPath(import.meta.url)), 'scripts', 'cwd-helper.cs');
+    const hash = createHash('sha256').update(readFileSync(src)).digest('hex').slice(0, 8);
+    const exe = path.join(os.tmpdir(), 'tterm-connect', `cwd-helper-${hash}.exe`);
+    if (existsSync(exe)) return exe;
+    mkdirSync(path.dirname(exe), { recursive: true });
+    const csc = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+    const tmp = `${exe}.${process.pid}.tmp`;
+    await run(csc, ['-nologo', '-optimize', '-platform:x64', `-out:${tmp}`, src]);
+    renameSync(tmp, exe);
+    log(`compiled ${exe}`);
+    return exe;
+  })();
+  cwdHelperExe.catch(() => { cwdHelperExe = null; }); // try again next time
+  return cwdHelperExe;
+}
+
+// The folder a shell's prompt reports: OSC 7 (file://host/path, from bash,
+// zsh, fish, starship) or OSC 9;9 ("C:\path", from Windows Terminal setups,
+// oh-my-posh). The last one in this output chunk wins.
+const OSC_CWD = /\x1b\](?:7;file:\/\/[^/\x07\x1b]*([^\x07\x1b]*)|9;9;"?([^"\x07\x1b]*)"?)(?:\x07|\x1b\\)/g;
+function trackReportedCwd(conn, text) {
+  if (!text.includes('\x1b]')) return;
+  for (const m of text.matchAll(OSC_CWD)) {
+    let dir = m[2];
+    if (m[1] != null) {
+      try { dir = decodeURIComponent(m[1]); } catch { dir = m[1]; }
+      if (process.platform === 'win32') dir = dir.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, '\\');
+    }
+    if (dir) conn.reportedCwd = dir;
+  }
+}
 
 function bufferOutput(conn, buf) {
   conn.buffer.push(buf);
@@ -572,6 +706,7 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
   conn.metaSaved = false;
   log(`session ${sid(sessionId)}: spawned ${shell}${args.length ? ' ' + args.join(' ') : ''} (${cols}x${rows}) in ${cwd}`);
   conn.pty.onData(data => {
+    trackReportedCwd(conn, data);
     const buf = Buffer.from(data, 'utf8');
     bufferOutput(conn, buf);
     safeSend(conn, sessionId, buf);
