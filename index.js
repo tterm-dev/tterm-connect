@@ -30,6 +30,19 @@ import { createRequire } from 'module';
 // error, so the start-up log shows the version: an old one needs `npm install`.
 const PTY_VERSION = createRequire(import.meta.url)('node-pty/package.json').version;
 
+// node-pty uses ConPTY only on Windows build 18309 and later; below that
+// (Windows 10 1809 is 17763) it falls back to winpty, even with useConptyDll.
+// winpty drops ESC[?2004h, so Claude Code got a large paste with no paste
+// markers and kept only its end. The ConPTY that ships with node-pty does
+// not depend on the Windows build, so with useConptyDll the check is lifted.
+if (process.platform === 'win32') {
+  const { WindowsPtyAgent } = createRequire(import.meta.url)('node-pty/lib/windowsPtyAgent.js');
+  const buildNumber = WindowsPtyAgent.prototype._getWindowsBuildNumber;
+  WindowsPtyAgent.prototype._getWindowsBuildNumber = function () {
+    return this._useConptyDll ? Infinity : buildNumber.call(this);
+  };
+}
+
 // Browser-style WebSocket: global on Node >= 22, the `ws` package elsewhere
 // (it exposes the same onopen/onmessage/onclose/onerror surface).
 let WebSocketImpl = globalThis.WebSocket;
@@ -539,9 +552,8 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
       cwd,
       env,
       // Windows: use the ConPTY that ships with node-pty, not the one built
-      // into Windows. Windows 10's own ConPTY garbles a large paste (Claude
-      // Code showed only its end); the shipped one keeps it whole, so every
-      // Windows version gets the same behavior.
+      // into Windows (or winpty on old builds, see the top of this file), so
+      // every Windows version passes a large paste whole.
       useConptyDll: process.platform === 'win32',
     });
   } catch (err) {
