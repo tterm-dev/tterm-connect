@@ -533,6 +533,11 @@ function spawnPty(conn, sessionId, cols = 80, rows = 24, preset = null) {
       cols, rows,
       cwd,
       env,
+      // Windows: use the ConPTY that ships with node-pty, not the one built
+      // into Windows. Windows 10's own ConPTY garbles a large paste (Claude
+      // Code showed only its end); the shipped one keeps it whole, so every
+      // Windows version gets the same behavior.
+      useConptyDll: process.platform === 'win32',
     });
   } catch (err) {
     log(`session ${sid(sessionId)}: spawn failed for ${shell}: ${err.message}`);
